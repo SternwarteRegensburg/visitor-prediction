@@ -8,26 +8,56 @@ using InteractiveUtils
 begin 
 	using RxInfer, Random, Plots, StableRNGs, LinearAlgebra, StatsPlots, LaTeXStrings, DataFrames, CSV, GLM
 	using PlutoUI
+	import StatsFuns: softplus
 end
 
 # ╔═╡ 6311f9b4-2300-4695-95f9-4ed0de7d07fe
 begin
-	visitors = [27,12,48,30,70,115,110,75,75,160,105,150,32,120]
-	weather = [3,3,3,1,3,2,2,1,3,1,2,1,3,1,]
-	hits = [59,49,56,76,112,128,128,125,69,134,100,134,63,93,]
-	website = [missing,missing,missing,missing,missing,missing,missing,missing,missing,missing,195,232,104,156,]
+	visitors = Union{Float64, Missing}[27,12,48,30,70,115,110,75,75,160,105,150,32,120, missing]
+	visitors_mean = mean(skipmissing(visitors))
+	visitors_var = var(skipmissing(visitors))
+	
+	clouds = Float64[3,3,3,1,3,2,2,1,3,1,2,1,3,1,3]
+	clouds_mean = mean(clouds)
+	clouds_var = var(clouds)
+	
+	# google hits
+	hits = Float64[59,49,56,76,112,128,128,125,69,134,100,134,63,93,100]
+	hits_mean = mean(hits)
+	hits_var = var(hits)
+	
+	website = Union{Float64, Missing}[
+		missing,missing,missing,missing,missing,missing,missing,missing,missing,missing,195,232,104,156,195
+	]
+	website[ismissing.(website)] .= 1.7*hits[ismissing.(website)]
+	website = Float64.(website)
+	website_mean = mean(skipmissing(website))
+	website_var = var(skipmissing(website))
 end
+
+# ╔═╡ 6b14cafe-8f11-465f-bd83-655e9e512656
+features = Union{Vector{Float64}, Missing}[
+	[
+		clouds[i],
+		hits[i],
+		website[i]
+	]
+	for i in eachindex(visitors)
+]
+
+# ╔═╡ 9a8e48b8-1e59-4a4e-9733-35a4a415068a
+state_dim = 3
+
+# ╔═╡ 70aa8cd2-c8f3-42d0-81ca-6ddef14c265e
+dotsoftplus(a, x) = softplus(dot(a, x))
 
 # ╔═╡ 23adacde-7dd2-4083-b2bd-8c7446d9cea2
 # model definction
 @model function visitors_ssm_advanced(
-	weather, # cloudiness
-	hits, # google hits
-	website, # website access numbers
+	features, # vector of vectors 
 	visitor_measurements, # number of visitors counted
 	h0, θ0, a0, P0, γ0 # some inits
 )
-
     a ~ a0
     θ ~ θ0
     h_prior ~ h0
@@ -35,17 +65,161 @@ end
     γ ~ γ0
 	
     h_prev = h_prior
-    for i in eachindex(y)
+    for i in eachindex(visitor_measurements)
         
         h[i] ~ CTransition(h_prev, a, P)
-		# TODO must be multi variant so we can not add everything as extra items
-        x[i]  ~ MvNormal(μ=h[i], Λ=diageye(state_dim))
+        features[i] ~ MvNormal(μ=h[i], Λ=diageye(state_dim))
         _y[i] ~ softdot(θ, h[i], γ)
         visitor_measurements[i] ~ Normal(μ=softplus(_y[i]), γ=1e4)
         h_prev = h[i]
     end
 
 end
+
+# ╔═╡ 26f23588-487c-47cc-b115-abf2152b3820
+transformation = a -> reshape(a, state_dim, state_dim)
+
+# ╔═╡ f672692a-3270-4437-8899-89c646546eea
+visitors_ssm_advanced_meta = @meta begin 
+    softplus() -> Linearization()
+    CTransition() -> CTMeta(transformation)
+end
+
+# ╔═╡ a27fb0cc-91a0-471d-8f62-c84678412ee8
+visitors_ssm_advanced_constraints = @constraints begin
+    q(h_prior, h, a, P, γ, _y, visitor_measurements, θ) = q(h_prior, h)q(a)q(P)q(γ)q(_y, visitor_measurements)q(θ)
+end
+
+# ╔═╡ 66dabe95-a596-42e6-90dc-bdfa80186819
+begin
+	feature_means = [
+		# clouds
+		clouds_mean
+		# hits
+		hits_mean
+		# website
+		website_mean
+	]
+	feature_vars = [
+		# clouds
+		clouds_var
+		# hits
+		hits_var
+		# website
+		website_var
+	]
+	prior_P = ExponentialFamily.WishartFast(
+		state_dim+2, 
+		feature_vars .* diageye(state_dim)
+	)
+	prior_a = MvNormalMeanPrecision(ones(state_dim^2), diageye(state_dim^2));
+	
+	prior_γ = GammaShapeRate(1.0, var(filter(!ismissing, visitors)))
+	prior_h = MvNormalMeanPrecision(feature_means, diageye(state_dim))
+	prior_θ = MvNormalMeanPrecision(ones(state_dim), diageye(state_dim))
+	
+	imarginals = @initialization begin 
+	    q(h) = prior_h
+	    q(a) = prior_a
+	    q(P) = prior_P
+	    q(γ) = prior_γ
+	    q(θ) = prior_θ
+	end
+end
+
+# ╔═╡ aa1e0cbf-cac3-46ca-bfe1-dd32ad02297b
+visitors_model_advanced = visitors_ssm_advanced(
+	h0=prior_h, 
+	θ0=prior_θ, 
+	a0=prior_a, 
+	P0=prior_P, 
+	γ0=prior_γ
+)
+
+
+# ╔═╡ 183506d4-aec8-4ca0-ab44-01eaa2df2798
+result = infer(
+    model = visitors_model_advanced,
+    data  = (features=features, visitor_measurements=visitors), 
+    options = (limit_stack_depth = 2, ), 
+    returnvars = KeepLast(),
+    predictvars = KeepLast(),
+    initialization = imarginals,
+    constraints = visitors_ssm_advanced_constraints,
+    meta = visitors_ssm_advanced_meta,
+    iterations = 10,
+    showprogress=true,
+)
+
+# ╔═╡ fbfbaf01-135f-4637-80bf-fc21a66c17f8
+# For a sake of this example, we extract only predictions
+mean_visitors, cov_visitors = mean.(result.predictions[:visitor_measurements]), cov.(result.predictions[:visitor_measurements])
+
+
+# ╔═╡ 02760ad3-29d4-4260-a298-149046f3f22f
+begin
+
+	plot(
+		visitors,
+		color=:darkblue, 
+		markerstrokewidth=0,
+		label="Observed Visitor Count", 
+		alpha=0.6
+	)
+
+	plot!(
+		mean_visitors, ribbon=sqrt.(cov_visitors), 
+		color=:orange, 
+		fillalpha=0.3,
+		label="Predicted Mean ± Std Dev of Visitors"
+	)
+	vline!([length(visitors)-1], 
+       label="Prediction Start", 
+       linestyle=:dash, 
+       linecolor=:green)
+end
+
+# ╔═╡ 5efd8cd9-51be-46c3-b962-89c4aecd7ea5
+result.predictions
+
+# ╔═╡ 7280b2b7-83b8-4a35-b9bf-0f09d6286335
+last(mean_visitors)
+
+# ╔═╡ 6347887f-1296-41f2-babb-ef737b319e90
+cov_visitors
+
+# ╔═╡ 58d23044-53d5-490e-a729-6e4461dd9464
+begin
+	mean_features, cov_features = mean.(result.predictions[:features]), var.(result.predictions[:features])
+
+	mean_x1, cov_x1 = getindex.(mean_features, 1), getindex.(cov_features, 1)
+	mean_x2, cov_x2 = getindex.(mean_features, 2), getindex.(cov_features, 2)
+	mean_x3, cov_x3 = getindex.(mean_features, 3), getindex.(cov_features, 3)
+end
+
+# ╔═╡ 923d4bcc-e6e2-435f-84c3-4f5de3e34089
+plot(
+	mean_x1, ribbon=sqrt.(cov_x1), 
+	color=:orange, 
+	fillalpha=0.3,
+	label="Predicted Mean ± Std Dev of Clouds"
+)
+
+# ╔═╡ d5a1bc31-7a1f-4a3b-88eb-b0352bb5c092
+plot(
+	mean_x2, ribbon=sqrt.(cov_x2), 
+	color=:orange, 
+	fillalpha=0.3,
+	label="Predicted Mean ± Std Dev of Google Hits"
+)
+
+# ╔═╡ 9ec489aa-b34f-4b9a-ac60-bcfabe516bd2
+plot(
+	mean_x3, ribbon=sqrt.(cov_x3), 
+	color=:orange, 
+	fillalpha=0.3,
+	label="Predicted Mean ± Std Dev of Website Hits"
+)
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
@@ -60,6 +234,7 @@ PlutoUI = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 RxInfer = "86711068-29c9-4ff7-b620-ae75d7495b3d"
 StableRNGs = "860ef19b-820b-49d6-a774-d7a799459cd3"
+StatsFuns = "4c63d2b9-4356-54db-8cca-17b64c39e42c"
 StatsPlots = "f3b207a7-027a-5e70-b257-86293d7955fd"
 
 [compat]
@@ -71,6 +246,7 @@ Plots = "~1.40.11"
 PlutoUI = "~0.7.61"
 RxInfer = "~4.3.1"
 StableRNGs = "~1.0.2"
+StatsFuns = "~1.3.2"
 StatsPlots = "~0.15.7"
 """
 
@@ -80,7 +256,7 @@ PLUTO_MANIFEST_TOML_CONTENTS = """
 
 julia_version = "1.11.4"
 manifest_format = "2.0"
-project_hash = "b581a21746bac523d29a6840a7a56d7feb7d9bab"
+project_hash = "8279f40313642a32cff70ca5c15093ffa75f3a2a"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "e2478490447631aedba0823d4d7a80b2cc8cdb32"
@@ -2280,6 +2456,24 @@ version = "1.4.1+2"
 # ╔═╡ Cell order:
 # ╠═e5dd57b0-0817-11f0-37b9-19498d4021dc
 # ╠═6311f9b4-2300-4695-95f9-4ed0de7d07fe
+# ╠═6b14cafe-8f11-465f-bd83-655e9e512656
+# ╠═9a8e48b8-1e59-4a4e-9733-35a4a415068a
+# ╠═70aa8cd2-c8f3-42d0-81ca-6ddef14c265e
 # ╠═23adacde-7dd2-4083-b2bd-8c7446d9cea2
+# ╠═26f23588-487c-47cc-b115-abf2152b3820
+# ╠═f672692a-3270-4437-8899-89c646546eea
+# ╠═a27fb0cc-91a0-471d-8f62-c84678412ee8
+# ╠═66dabe95-a596-42e6-90dc-bdfa80186819
+# ╠═aa1e0cbf-cac3-46ca-bfe1-dd32ad02297b
+# ╠═183506d4-aec8-4ca0-ab44-01eaa2df2798
+# ╠═fbfbaf01-135f-4637-80bf-fc21a66c17f8
+# ╠═02760ad3-29d4-4260-a298-149046f3f22f
+# ╠═5efd8cd9-51be-46c3-b962-89c4aecd7ea5
+# ╠═7280b2b7-83b8-4a35-b9bf-0f09d6286335
+# ╠═6347887f-1296-41f2-babb-ef737b319e90
+# ╠═58d23044-53d5-490e-a729-6e4461dd9464
+# ╠═923d4bcc-e6e2-435f-84c3-4f5de3e34089
+# ╠═d5a1bc31-7a1f-4a3b-88eb-b0352bb5c092
+# ╠═9ec489aa-b34f-4b9a-ac60-bcfabe516bd2
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002
